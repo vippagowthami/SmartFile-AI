@@ -1,0 +1,10 @@
+.env
+chat_history.json
+chat_store.json
+chroma_db/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store

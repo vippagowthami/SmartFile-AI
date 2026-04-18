@@ -1,0 +1,10 @@
+chromadb>=0.5,<1
+google-genai>=1.0,<2
+langchain>=0.3,<1
+langchain-core>=0.3,<1
+langchain-text-splitters>=0.3,<1
+pypdf>=5,<6
+pywin32>=306; platform_system == "Windows"
+python-docx>=1.1,<2
+python-dotenv>=1.0,<2
+streamlit>=1.38,<2

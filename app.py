@@ -1,1125 +1,609 @@
-from __future__ import annotations
-
-import hashlib
-import importlib
-import json
-import os
-import re
-import time
-import tempfile
+import hashlib , importlib , json, os, re, time, urllib.error, urllib.request
 from pathlib import Path
-from typing import Any
-
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
-
 import streamlit as st
 from chromadb import PersistentClient
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
 from docx import Document
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
-
+BASE_DIR = Path(__file__).resolve().parent
 APP_TITLE = "SmartFile-AI"
-APP_SUBTITLE = "Ask questions about uploaded documents or use Gemini for general answers."
-CHROMA_PATH = Path("chroma_db")
-CHAT_HISTORY_PATH = Path("chat_history.json")
+DB_PATH = BASE_DIR / "chroma_db"
+HISTORY_PATH = BASE_DIR / "chat_history.json"
+FILES_PATH = BASE_DIR / "stored_files"
 COLLECTION_NAME = "smart_file_documents"
-CHAT_MODEL = "gemini-2.5-flash"
-EMBED_MODEL = "gemini-embedding-001"
-SIMILARITY_THRESHOLD = 0.55
-MAX_UPLOADS = 5
-EMBED_BATCH_SIZE = 16
-GEMINI_RETRY_ATTEMPTS = 3
-DOC_INTENT_KEYWORDS = {
-    "file",
-    "files",
-    "document",
-    "documents",
-    "doc",
-    "pdf",
-    "txt",
-    "uploaded",
-    "upload",
-    "report",
-    "policy",
-    "rules",
-    "from the file",
-    "from file",
-    "in the file",
-    "in the document",
+CHAT_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+OPENROUTER_MODELS = ["openai/gpt-4o-mini", "google/gemini-2.0-flash-001"]
+LOCAL_EMBED_DIM = 256
+MAX_FILES = 5
+MAX_RETRIES = 3
+THRESHOLD = 0.55
+NOT_FOUND = "I could not find this information in the uploaded files."
+GEN_FAIL = "I could not generate a response right now."
+RESPONSE_STYLE = (
+    "Response format:\n"
+    "1) Start with a direct answer in 1-2 lines.\n"
+    "2) Then write 'Main points:' and provide 3-5 bullet points.\n"
+    "3) Highlight key terms using **bold** markdown."
+)
+USER_AVATAR = "🧑"
+ASSISTANT_AVATAR = "🤖"
+SMALL_TALK = {
+    "hi": "Hi! Ask from uploaded files, or ask any general question.",
+    "hello": "Hello! Ask from uploaded files, or ask any general question.",
+    "hey": "Hey! Ask from uploaded files, or ask any general question.",
+    "hii": "Hi! Ask from uploaded files, or ask any general question.",
+    "thanks": "You are welcome!",
+    "thank you": "You are welcome!",
+    "ok": "Okay, what do you want to ask next?",
+    "okay": "Okay, what do you want to ask next?",
 }
-TEXT_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+DOC_HINTS = {
+    "file","files","document","documents","resume","cv","pdf","doc","docx","txt","uploaded","from file","from the file","from document",
+}
+SUMMARY_HINTS = {
+    "summarize","summary","summarise","briefly explain","give a summary","tell me about",
+}
+FILES_HINTS = {
+    "what are the files uploaded","what files are uploaded","which files are uploaded","uploaded files","files uploaded","list the files","show the files",
+}
+SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
 
+def annotate_source(answer, source_label):
+    if not answer:
+        return answer
+    if "Source:" in answer:
+        return answer
+    return f"{answer}\n\nSource: {source_label}"
 
-def get_api_key() -> str | None:
-    return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-
+def get_api_key():
+    return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 
 @st.cache_resource(show_spinner=False)
-def get_gemini_client() -> genai.Client | None:
-    api_key = get_api_key()
-    if not api_key:
-        return None
-    return genai.Client(api_key=api_key)
-
+def get_llm_backend():
+    key = get_api_key()
+    if not key:
+        return {"provider": "none", "client": None, "key": None}
+    if key.startswith("sk-or-"):
+        return {"provider": "openrouter", "client": None, "key": key}
+    return {"provider": "gemini", "client": genai.Client(api_key=key), "key": key}
 
 @st.cache_resource(show_spinner=False)
-def get_chroma_collection():
-    CHROMA_PATH.mkdir(exist_ok=True)
-    client = PersistentClient(path=str(CHROMA_PATH))
-    return client.get_or_create_collection(
+def get_collection():
+    DB_PATH.mkdir(exist_ok=True)
+    return PersistentClient(path=str(DB_PATH)).get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
 
+def ensure_files_dir():
+    FILES_PATH.mkdir(exist_ok=True)
 
-def initialize_state() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = load_chat_history()
-    st.session_state.setdefault("indexed_files", set())
+def list_stored_files():
+    ensure_files_dir()
+    return sorted([p.name for p in FILES_PATH.iterdir() if p.is_file()])
 
+def save_uploaded_file(uploaded_file):
+    ensure_files_dir()
+    path = FILES_PATH / uploaded_file.name
+    path.write_bytes(uploaded_file.getbuffer())
+    return path
 
-def clear_chat_history() -> None:
-    st.session_state.messages = []
-    save_chat_history()
+def source_doc_ids(collection, source_name):
+    found = collection.get(where={"source": source_name}, include=[])
+    return found.get("ids", []) if found else []
 
+def delete_source_from_collection(collection, source_name):
+    ids = source_doc_ids(collection, source_name)
+    if ids:
+        collection.delete(ids=ids)
 
-def append_message(role: str, content: str) -> None:
-    st.session_state.messages.append({"role": role, "content": content})
-    save_chat_history()
+def delete_stored_file(collection, source_name):
+    delete_source_from_collection(collection, source_name)
+    p = FILES_PATH / source_name
+    if p.exists():
+        p.unlink()
 
+def clear_all_stored_data(collection):
+    for name in list_stored_files():
+        p = FILES_PATH / name
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    all_items = collection.get(include=[])
+    ids = all_items.get("ids", []) if all_items else []
+    if ids:
+        collection.delete(ids=ids)
 
-def load_chat_history() -> list[dict[str, str]]:
-    if not CHAT_HISTORY_PATH.exists():
+def retry(fn):
+    last = None
+    for i in range(MAX_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            msg = str(e).lower()
+            if not any(x in msg for x in ["429", "503", "resource_exhausted", "unavailable", "high demand"]) or i == MAX_RETRIES - 1:
+                raise
+            retry_match = re.search(r"retry in\s*([0-9]+(?:\.[0-9]+)?)s", msg)
+            delay = float(retry_match.group(1)) if retry_match else min(4, 2**i)
+            time.sleep(min(60, max(1, delay)))
+    raise last if last else RuntimeError("Request failed")
+
+def readable_error(err):
+    msg = str(err)
+    low = msg.lower()
+    if "resource_exhausted" in low or "quota exceeded" in low or "429" in low:
+        retry_match = re.search(r"retry in\s*([0-9]+(?:\.[0-9]+)?)s", low)
+        wait_text = f" Please wait about {int(float(retry_match.group(1)))} seconds and retry." if retry_match else " Please wait a minute and retry."
+        return "Gemini quota limit reached during indexing." + wait_text
+    return msg
+
+def generate_openrouter(key, model, prompt, temperature=0.2, max_tokens=512):
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://localhost",
+            "X-Title": APP_TITLE,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+
+def generate_with_fallback(backend, prompt, temperature=0.2, fallback=GEN_FAIL):
+    provider = backend.get("provider") if backend else "none"
+    if provider == "gemini":
+        client = backend.get("client")
+        for model in CHAT_MODELS:
+            try:
+                r = retry(
+                    lambda: client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(temperature=temperature, max_output_tokens=512),
+                    )
+                )
+                txt = (r.text or "").strip()
+                if txt:
+                    return txt
+            except Exception:
+                pass
+    elif provider == "openrouter":
+        key = backend.get("key")
+        for model in OPENROUTER_MODELS:
+            try:
+                txt = retry(lambda: generate_openrouter(key, model, prompt, temperature=temperature, max_tokens=512))
+                if txt:
+                    return txt
+            except Exception:
+                pass
+    return fallback
+
+def load_history():
+    if not HISTORY_PATH.exists():
         return []
-
     try:
-        data = json.loads(CHAT_HISTORY_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            return []
-
-        messages: list[dict[str, str]] = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role", "assistant"))
-            content = str(item.get("content", ""))
-            if role in {"user", "assistant"} and content:
-                messages.append({"role": role, "content": content})
-        return messages
+        return [
+            m
+            for m in json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+            if isinstance(m, dict) and m.get("role") in {"user", "assistant"} and m.get("content")
+        ]
     except Exception:
         return []
 
+def save_history():
+    HISTORY_PATH.write_text(json.dumps(st.session_state.messages, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def save_chat_history() -> None:
-    CHAT_HISTORY_PATH.write_text(chat_history_as_json(), encoding="utf-8")
+def add_message(role, content):
+    st.session_state.messages.append({"role": role, "content": content})
+    save_history()
 
-
-def clean_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def file_hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def is_resource_exhausted_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "resource_exhausted" in message or "429" in message or "resource exhausted" in message
-
-
-def run_with_retry(operation, *, fallback_message: str | None = None):
-    last_error: Exception | None = None
-    for attempt in range(GEMINI_RETRY_ATTEMPTS):
-        try:
-            return operation()
-        except Exception as exc:
-            last_error = exc
-            if not is_resource_exhausted_error(exc) or attempt == GEMINI_RETRY_ATTEMPTS - 1:
-                raise
-            time.sleep(2**attempt)
-
-    if fallback_message is not None:
-        return fallback_message
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Gemini operation failed unexpectedly.")
-
-
-def extract_text_from_pdf(file_path: Path) -> str:
-    reader = PdfReader(str(file_path))
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return clean_text("\n".join(pages))
-
-
-def extract_text_from_txt(file_path: Path) -> str:
-    return clean_text(file_path.read_text(encoding="utf-8", errors="ignore"))
-
-
-def extract_text_from_docx(file_path: Path) -> str:
-    document = Document(str(file_path))
-    paragraphs = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
-    return clean_text("\n".join(paragraphs))
-
-
-def extract_text_from_doc(file_path: Path) -> str:
-    pythoncom = None
-    word = None
+def extract_doc_text(path):
+    py = wd = None
     try:
-        pythoncom = importlib.import_module("pythoncom")
-        win32_client = importlib.import_module("win32com.client")
-
-        pythoncom.CoInitialize()
-        word = win32_client.DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
-        document = word.Documents.Open(str(file_path), ReadOnly=1)
-        text = clean_text(document.Content.Text)
-        document.Close(False)
-        return text
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not extract text from .doc file in this environment. "
-            "Install Microsoft Word or convert the file to .docx/.pdf/.txt."
-        ) from exc
+        py = importlib.import_module("pythoncom")
+        w32 = importlib.import_module("win32com.client")
+        py.CoInitialize()
+        wd = w32.DispatchEx("Word.Application")
+        wd.Visible = False
+        wd.DisplayAlerts = 0
+        doc = wd.Documents.Open(str(path), ReadOnly=1)
+        txt = (doc.Content.Text or "").strip()
+        doc.Close(False)
+        return txt
+    except Exception as e:
+        raise RuntimeError("Could not read .doc file. Convert to .docx/.pdf/.txt.") from e
     finally:
-        if word is not None:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        if pythoncom is not None:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        try:
+            if wd:
+                wd.Quit()
+            if py:
+                py.CoUninitialize()
+        except Exception:
+            pass
 
+def extract_text(path):
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        return " ".join((p.extract_text() or "").strip() for p in PdfReader(str(path)).pages).strip()
+    if ext == ".txt":
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    if ext == ".docx":
+        return " ".join(p.text.strip() for p in Document(str(path)).paragraphs if p.text.strip()).strip()
+    if ext == ".doc":
+        return extract_doc_text(path)
+    raise ValueError(f"Unsupported file type: {ext}")
 
-def extract_text_from_file(file_path: Path) -> str:
-    suffix = file_path.suffix.lower()
-    if suffix == ".pdf":
-        return extract_text_from_pdf(file_path)
-    if suffix == ".txt":
-        return extract_text_from_txt(file_path)
-    if suffix == ".docx":
-        return extract_text_from_docx(file_path)
-    if suffix == ".doc":
-        return extract_text_from_doc(file_path)
-    raise ValueError(f"Unsupported file type: {suffix}")
+def local_embed_text(text, dim=LOCAL_EMBED_DIM):
+    vec = [0.0] * dim
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    if not tokens:
+        return vec
+    for tok in tokens:
+        h = int(hashlib.sha256(tok.encode("utf-8")).hexdigest()[:8], 16)
+        vec[h % dim] += 1.0
+    norm = sum(v * v for v in vec) ** 0.5
+    if norm == 0:
+        return vec
+    return [v / norm for v in vec]
 
+def collection_embedding_dim(collection):
+    try:
+        sample = collection.get(limit=1, include=["embeddings"])
+        embeddings = sample.get("embeddings", []) if sample else []
+        if embeddings and embeddings[0]:
+            return len(embeddings[0])
+    except Exception:
+        pass
+    return LOCAL_EMBED_DIM
 
-def split_text(text: str) -> list[str]:
-    chunks = TEXT_SPLITTER.split_text(text)
-    return [chunk for chunk in (clean_text(chunk) for chunk in chunks) if chunk]
+def embed_texts(_backend, texts, collection=None):
+    # Keep embedding size aligned with the collection's configured dimension.
+    dim = collection_embedding_dim(collection) if collection is not None else LOCAL_EMBED_DIM
+    # Local deterministic embeddings avoid external quota failures during indexing/retrieval.
+    return [local_embed_text(t, dim=dim) for t in texts]
 
+def index_file(backend, collection, file_path, file_name):
+    sig = hashlib.sha256(file_path.read_bytes()).hexdigest()[:16]
+    # Chroma expects exactly one top-level operator in complex metadata filters.
+    existing = collection.get(
+        where={"$and": [{"source": file_name}, {"file_signature": sig}]},
+        include=[],
+    )
+    existing_ids = existing.get("ids", []) if existing else []
+    if existing_ids:
+        return len(existing_ids)
 
-def embed_texts(client: genai.Client, texts: list[str]) -> list[list[float]]:
-    embeddings: list[list[float]] = []
-    for start_index in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[start_index : start_index + EMBED_BATCH_SIZE]
-
-        def embed_batch() -> list[list[float]]:
-            response = client.models.embed_content(model=EMBED_MODEL, contents=batch)
-            if getattr(response, "embeddings", None):
-                return [list(embedding.values) for embedding in response.embeddings]
-            if getattr(response, "embedding", None):
-                return [list(response.embedding.values)]
-            raise RuntimeError("Gemini embedding response did not include vectors.")
-
-        embeddings.extend(run_with_retry(embed_batch))
-
-    return embeddings
-
-
-def ingest_uploaded_file(client: genai.Client, collection, file_path: Path, original_name: str) -> int:
-    text = extract_text_from_file(file_path)
+    text = extract_text(file_path)
     if not text:
         return 0
-
-    chunks = split_text(text)
+    # Keep retrieval accurate by replacing previous chunks from the same file name.
+    delete_source_from_collection(collection, file_name)
+    chunks = [c.strip() for c in SPLITTER.split_text(text) if c.strip()]
     if not chunks:
         return 0
-
-    embeddings = embed_texts(client, chunks)
-    signature = file_hash(file_path.read_bytes())[:16]
-
-    ids = []
-    documents = []
-    metadatas = []
-    for index, (chunk, embedding) in enumerate(zip(chunks, embeddings, strict=True)):
-        ids.append(f"{signature}-{index}")
-        documents.append(chunk)
-        metadatas.append(
-            {
-                "source": original_name,
-                "chunk_index": index,
-                "file_signature": signature,
-                "file_type": file_path.suffix.lower().lstrip("."),
-            }
-        )
-
-    collection.upsert(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+    vecs = embed_texts(backend, chunks, collection=collection)
+    ids = [f"{sig}-{i}" for i in range(len(chunks))]
+    metas = [{"source": file_name, "chunk_index": i, "file_signature": sig} for i in range(len(chunks))]
+    collection.upsert(ids=ids, documents=chunks, metadatas=metas, embeddings=vecs)
     return len(chunks)
 
-
-def get_unique_sources(collection) -> list[str]:
-    data = collection.get(include=["metadatas"])
-    sources = sorted({metadata.get("source", "Unknown") for metadata in data.get("metadatas", []) if metadata})
-    return sources
-
-
-def query_relevant_chunks(client: genai.Client, collection, question: str, top_k: int = 4) -> list[dict[str, Any]]:
+def retrieve(backend, collection, question, k=4, source_name=None):
     if collection.count() == 0:
         return []
+    qv = embed_texts(backend, [question], collection=collection)[0]
+    kwargs = {
+        "query_embeddings": [qv],
+        "n_results": k,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if source_name:
+        kwargs["where"] = {"source": source_name}
+    r = collection.query(**kwargs)
+    docs = r.get("documents", [[]])[0]
+    metas = r.get("metadatas", [[]])[0]
+    dists = r.get("distances", [[]])[0]
+    return [
+        {
+            "text": d,
+            "source": m.get("source", "Unknown") if m else "Unknown",
+            "chunk_index": m.get("chunk_index", -1) if m else -1,
+            "sim": 1 - float(dist),
+        }
+        for d, m, dist in zip(docs, metas, dists)
+    ]
 
-    query_embedding = embed_texts(client, [question])[0]
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
-    )
+def doc_question(question, sources):
+    q = question.lower().strip()
+    return any(k in q for k in DOC_HINTS) or any((s.lower() in q) or (Path(s).stem.lower() in q) for s in sources)
 
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
+def mentioned_source(question, sources):
+    q = question.lower().strip()
+    for s in sources:
+        s_low = s.lower()
+        stem_low = Path(s).stem.lower()
+        if s_low in q or stem_low in q:
+            return s
+    return None
 
-    chunks: list[dict[str, Any]] = []
-    for document, metadata, distance in zip(documents, metadatas, distances, strict=False):
-        similarity = 1 - float(distance)
-        chunks.append(
+def summary_question(question):
+    q = question.lower().strip()
+    return any(k in q for k in SUMMARY_HINTS) or q.startswith("summarize ") or q.startswith("summarise ")
+
+def files_question(question):
+    q = question.lower().strip()
+    return any(k in q for k in FILES_HINTS)
+
+def answer_uploaded_files(sources):
+    if not sources:
+        return "No files are currently uploaded or indexed."
+    unique_sources = list(dict.fromkeys(sources))
+    return "Uploaded files: " + ", ".join(unique_sources)
+
+def source_suffix(sources):
+    unique_sources = [s for s in dict.fromkeys(sources) if s]
+    if not unique_sources:
+        return ""
+    return f"(source: {', '.join(unique_sources)})"
+
+def retrieve_safe(backend, collection, question, k=4, source_name=None):
+    try:
+        return retrieve(backend, collection, question, k=k, source_name=source_name)
+    except Exception:
+        return []
+
+def tokenize(text):
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 1]
+
+def lexical_retrieve(collection, question, k=4, source_name=None):
+    q_tokens = tokenize(question)
+    if not q_tokens:
+        return []
+    q_set = set(q_tokens)
+    where = {"source": source_name} if source_name else None
+    data = collection.get(where=where, include=["documents", "metadatas"])
+    docs = data.get("documents", []) if data else []
+    metas = data.get("metadatas", []) if data else []
+    ranked = []
+    for d, m in zip(docs, metas):
+        d_tokens = set(tokenize(d))
+        if not d_tokens:
+            continue
+        overlap = len(q_set & d_tokens)
+        if overlap == 0:
+            continue
+        score = overlap / max(1, len(q_set))
+        ranked.append(
             {
-                "text": document,
-                "source": metadata.get("source", "Unknown") if metadata else "Unknown",
-                "chunk_index": metadata.get("chunk_index", -1) if metadata else -1,
-                "similarity": similarity,
+                "text": d,
+                "source": (m or {}).get("source", "Unknown"),
+                "chunk_index": (m or {}).get("chunk_index", -1),
+                "sim": float(score),
             }
         )
-    return chunks
+    ranked.sort(key=lambda x: x["sim"], reverse=True)
+    return ranked[:k]
 
-
-def classify_query(client: genai.Client, question: str, sources: list[str]) -> str:
-    prompt = f"""Classify the user's question.
-Uploaded files: {', '.join(sources) if sources else 'None'}
-Question: {question}
-
-Return JSON with:
-- mode: "document" if the question should be answered from the uploaded files, otherwise "general"
-- reason: short explanation
-"""
-
-    response = run_with_retry(
-        lambda: client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=128,
-                response_mime_type="application/json",
-                response_schema={
-                    "type": "object",
-                    "properties": {
-                        "mode": {"type": "string", "enum": ["document", "general"]},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["mode", "reason"],
-                },
-            ),
-        )
-    )
-
-    try:
-        parsed = json.loads(response.text or "{}")
-        return str(parsed.get("mode", "general"))
-    except json.JSONDecodeError:
-        return "general"
-
-
-def is_likely_document_question(question: str, sources: list[str]) -> bool:
-    lower_question = question.lower()
-    if any(keyword in lower_question for keyword in DOC_INTENT_KEYWORDS):
-        return True
-
-    for source in sources:
-        source_name = source.lower()
-        source_stem = Path(source_name).stem
-        if source_name and source_name in lower_question:
-            return True
-        if source_stem and source_stem in lower_question:
-            return True
-
-    return False
-
-
-def generate_document_answer(client: genai.Client, question: str, chunks: list[dict[str, Any]]) -> str:
+def answer_from_docs(backend, question, chunks):
     if not chunks:
-        return "I could not find this information in the uploaded files."
-
-    context_lines = []
-    for chunk in chunks[:3]:
-        context_lines.append(
-            f"Source: {chunk['source']} | Chunk: {chunk['chunk_index']} | Similarity: {chunk['similarity']:.2f}\n{chunk['text']}"
+        return NOT_FOUND
+    context_chunks = chunks[:8] if summary_question(question) else chunks[:4]
+    context = "\n".join(
+        f"Source: {c['source']} | Chunk: {c['chunk_index']} | Similarity: {c['sim']:.2f}\n{c['text']}"
+        for c in context_chunks
+    )
+    if summary_question(question):
+        prompt = (
+            "Write a concise summary based only on the excerpts. "
+            "Use 3 to 5 short sentences. Do not mention the word 'excerpts'. "
+            "If the excerpts are incomplete, say the summary is partial.\n"
+            f"{RESPONSE_STYLE}\n\n"
+            f"Question: {question}\n\nExcerpts:\n{context}"
         )
+    else:
+        prompt = (
+            "Answer only from the excerpts. "
+            f"If the answer is clearly absent, reply exactly: {NOT_FOUND}.\n"
+            f"{RESPONSE_STYLE}\n\n"
+            f"Question: {question}\n\nExcerpts:\n{context}"
+        )
+    ans = generate_with_fallback(backend, prompt, temperature=0, fallback=NOT_FOUND)
+    if ans != NOT_FOUND:
+        src = [c.get("source", "") for c in chunks]
+        suffix = source_suffix(src)
+        if suffix and "(source:" not in ans.lower():
+            if summary_question(question):
+                ans = f"{ans}\n\n{suffix}"
+            else:
+                ans = f"{ans} {suffix}"
+    return ans
 
-    prompt = f"""Answer the question using only the document excerpts below.
-If the excerpts do not contain the answer, reply with exactly: I could not find this information in the uploaded files.
-
-Question: {question}
-
-Document excerpts:
-{chr(10).join(context_lines)}
-"""
-
-    response = run_with_retry(
-        lambda: client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=512,
-            ),
-        ),
-        fallback_message="I could not find this information in the uploaded files.",
+def general_prompt(question):
+    return (
+        "You are a helpful general-purpose chatbot. Answer the user's question directly and accurately. "
+        "Be concise unless the user asks for detail. If the question is ambiguous, state the most likely meaning and note the ambiguity. "
+        "If you are unsure, say so instead of inventing facts. Do not mention uploaded files unless the user asks about them.\n"
+        f"{RESPONSE_STYLE}\n\n"
+        f"Question: {question}"
     )
 
-    answer = (response.text or "").strip()
-    if not answer:
-        return "I could not find this information in the uploaded files."
+def answer_question(backend, collection, question, sources):
+    q = question.lower().strip()
+    if q in SMALL_TALK:
+        return SMALL_TALK[q]
 
-    if answer == "I could not find this information in the uploaded files.":
-        return answer
+    if files_question(question):
+        return answer_uploaded_files(sources)
 
-    sources = []
-    for chunk in chunks:
-        source = chunk["source"]
-        if source not in sources:
-            sources.append(source)
+    if doc_question(question, sources):
+        chosen_source = mentioned_source(question, sources)
+        top_k = 8 if summary_question(question) else 4
+        chunks = retrieve_safe(backend, collection, question, k=top_k, source_name=chosen_source)
+        if (not chunks) or (chunks and chunks[0]["sim"] < THRESHOLD and not summary_question(question)):
+            chunks = lexical_retrieve(collection, question, k=top_k, source_name=chosen_source)
+        if chunks and (chunks[0]["sim"] >= THRESHOLD or summary_question(question) or chunks[0]["sim"] > 0):
+            return answer_from_docs(backend, question, chunks)
+        return NOT_FOUND
+    ans = generate_with_fallback(backend, general_prompt(question), temperature=0.2, fallback=GEN_FAIL)
+    if ans == GEN_FAIL:
+        return annotate_source(local_general_answer(question), "local fallback")
+    return annotate_source(ans, "Gemini")
 
-    if "(Source:" not in answer and sources:
-        answer = f"{answer} (Source: {', '.join(sources)})"
-
-    return answer
-
-
-def generate_general_answer(client: genai.Client, question: str) -> str:
-    prompt = f"""You are a helpful general-purpose assistant.
-Answer the user's question clearly and accurately.
-Do not mention uploaded files unless the user asks about them.
-
-Question: {question}
-"""
-
-    response = run_with_retry(
-        lambda: client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.4,
-                max_output_tokens=512,
-            ),
-        ),
-        fallback_message="I could not generate a response right now.",
-    )
-
-    answer = (response.text or "").strip()
-    return answer or "I could not generate a response right now."
-
-
-def route_question(client: genai.Client, collection, question: str, sources: list[str]) -> str:
-    chunks = query_relevant_chunks(client, collection, question)
-
-    highest_similarity = chunks[0]["similarity"] if chunks else 0.0
-    if chunks and highest_similarity >= SIMILARITY_THRESHOLD:
-        return generate_document_answer(client, question, chunks)
-
-    if sources:
-        heuristic_document_mode = is_likely_document_question(question, sources)
-        if heuristic_document_mode:
-            if chunks and highest_similarity >= SIMILARITY_THRESHOLD:
-                return generate_document_answer(client, question, chunks)
-            return "I could not find this information in the uploaded files."
-
-    return generate_general_answer(client, question)
-
-
-def render_chat() -> None:
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-
-def chat_history_as_json() -> str:
-    return json.dumps(st.session_state.messages, indent=2, ensure_ascii=False)
-
-
-def chat_history_as_text() -> str:
-    lines: list[str] = []
-    for message in st.session_state.messages:
-        role = str(message.get("role", "assistant")).upper()
-        content = str(message.get("content", ""))
-        lines.append(f"{role}:\n{content}\n")
-    return "\n".join(lines).strip() + "\n"
-
-
-def render_hero(indexed_file_count: int, chunk_count: int) -> None:
-    st.markdown(
-        f"""
-        <section class="hero-shell">
-            <div class="hero-card">
-                <p class="hero-kicker">Smart Retrieval Workspace</p>
-                <h1 class="hero-title">{APP_TITLE}</h1>
-                <p class="hero-subtitle">{APP_SUBTITLE}</p>
-                <div class="hero-metrics">
-                    <div class="metric-pill">
-                        <span class="metric-label">Indexed Files</span>
-                        <span class="metric-value">{indexed_file_count}</span>
-                    </div>
-                    <div class="metric-pill">
-                        <span class="metric-label">Stored Chunks</span>
-                        <span class="metric-value">{chunk_count}</span>
-                    </div>
-                    <div class="metric-pill">
-                        <span class="metric-label">Mode</span>
-                        <span class="metric-value">Doc + General AI</span>
-                    </div>
-                </div>
-            </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def main() -> None:
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon="📄",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    initialize_state()
-
-    client = get_gemini_client()
-    collection = get_chroma_collection()
-
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="📄", layout="wide")
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=DM+Serif+Display:ital@0;1&display=swap');
-
-        :root,
-        :root[data-theme="light"],
-        :root[data-user-theme="light"] {
-            color-scheme: light;
-            --bg-1: #ffffff;
-            --bg-2: #ffffff;
-            --ink-1: #111111;
-            --ink-2: #2f2f2f;
-            --ink-soft: #5f5f5f;
-            --accent: #0f766e;
-            --accent-strong: #0d5f59;
-            --accent-2: #ea580c;
-            --card: rgba(255, 255, 255, 0.98);
-            --card-border: rgba(17, 17, 17, 0.14);
-            --hero-shadow: 0 16px 36px rgba(0, 0, 0, 0.08);
-            --surface: rgba(255, 255, 255, 0.98);
-            --surface-2: rgba(255, 255, 255, 0.94);
-            --sidebar-bg: #ffffff;
-        }
-
-        :root[data-user-theme="dark"],
-        :root[data-theme="dark"] {
-            color-scheme: dark;
-            --bg-1: #000000;
-            --bg-2: #000000;
-            --ink-1: #ffffff;
-            --ink-2: #e6e6e6;
-            --ink-soft: #cfcfcf;
-            --accent-strong: #14b8a6;
-            --accent-2: #fb923c;
-            --card: rgba(8, 8, 8, 0.95);
-            --card-border: rgba(255, 255, 255, 0.14);
-            --hero-shadow: 0 18px 44px rgba(0, 0, 0, 0.7);
-            --surface: rgba(0, 0, 0, 0.95);
-            --surface-2: rgba(0, 0, 0, 0.88);
-            --sidebar-bg: #000000;
-        }
-
-        html, body,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stHeader"],
-            background: var(--bg-1) !important;
-            color: var(--ink-1) !important;
-        }
-
-        :root[data-user-theme="light"] [data-testid="stAppViewContainer"],
-        :root[data-theme="light"] [data-testid="stAppViewContainer"],
-        :root[data-user-theme="light"] [data-testid="stHeader"],
-        :root[data-theme="light"] [data-testid="stHeader"],
-        :root[data-user-theme="light"] [data-testid="stToolbar"],
-        :root[data-theme="light"] [data-testid="stToolbar"] {
-            background: #ffffff !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stAppViewContainer"],
-        :root[data-theme="dark"] [data-testid="stAppViewContainer"],
-        :root[data-user-theme="dark"] [data-testid="stHeader"],
-        :root[data-theme="dark"] [data-testid="stHeader"],
-        :root[data-user-theme="dark"] [data-testid="stToolbar"],
-        :root[data-theme="dark"] [data-testid="stToolbar"] {
-            background: #000000 !important;
-        }
-
-        .stApp {
-            font-family: "Space Grotesk", "Segoe UI", sans-serif;
-            color: var(--ink-1);
-            background: var(--bg-1);
-        }
-
-        .block-container {
-            padding-top: 1.4rem;
-            padding-bottom: 2.4rem;
-            max-width: 1060px;
-        }
-
-        h1, h2, h3, h4, p, li, label, span, div {
-            color: var(--ink-1);
-        }
-
-        p, li {
-            color: var(--ink-2);
-            line-height: 1.52;
-        }
-
-        [data-testid="stMarkdownContainer"],
-        [data-testid="stMarkdownContainer"] p,
-        [data-testid="stMarkdownContainer"] li,
-        [data-testid="stMarkdownContainer"] span,
-        [data-testid="stCaptionContainer"],
-        [data-testid="stCaptionContainer"] p,
-        [data-testid="stSidebar"] p,
-        [data-testid="stSidebar"] li,
-        [data-testid="stSidebar"] span,
-        [data-testid="stSidebar"] label,
-        .stFileUploader label,
-        .stFileUploader p {
-            color: var(--ink-1) !important;
-        }
-
-        section.hero-shell {
-            margin: 0.18rem 0 1.05rem 0;
-            animation: fadeUp 500ms ease;
-        }
-
-        .hero-card {
-            background: linear-gradient(135deg, var(--surface), var(--surface-2));
-            border: 1px solid var(--card-border);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 1.25rem 1.25rem 1.05rem 1.25rem;
-            box-shadow: var(--hero-shadow);
-            text-align: left;
-        }
-
-        .hero-kicker {
-            margin: 0;
-            font-size: 0.8rem;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            color: var(--accent);
-            font-weight: 700;
-        }
-
-        .hero-title {
-            margin: 0.26rem 0 0.34rem 0;
-            font-family: "DM Serif Display", Georgia, serif;
-            font-size: clamp(1.8rem, 3.2vw, 2.4rem);
-            line-height: 1.08;
-            color: var(--ink-1);
-            text-wrap: balance;
-        }
-
-        .hero-subtitle {
-            margin: 0;
-            color: var(--ink-soft);
-            font-size: 0.95rem;
-            max-width: 680px;
-        }
-
-        .hero-metrics {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.58rem;
-            margin-top: 0.9rem;
-        }
-
-        .metric-pill {
-            background: color-mix(in srgb, var(--accent) 14%, transparent);
-            border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
-            border-radius: 999px;
-            padding: 0.4rem 0.72rem;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.45rem;
-        }
-
-        .metric-label {
-            color: color-mix(in srgb, var(--ink-1) 74%, var(--accent));
-            font-weight: 600;
-            font-size: 0.79rem;
-        }
-
-        .metric-value {
-            color: var(--ink-1);
-            font-size: 0.84rem;
-            font-weight: 700;
-        }
-
-        [data-testid="stSidebar"] {
-            background: var(--sidebar-bg);
-            border-right: 1px solid color-mix(in srgb, var(--ink-1) 10%, transparent);
-            min-width: clamp(240px, 22vw, 320px) !important;
-            width: clamp(240px, 22vw, 320px) !important;
-        }
-
-        :root[data-user-theme="light"] [data-testid="stSidebar"],
-        :root[data-theme="light"] [data-testid="stSidebar"] {
-            background: #ffffff !important;
-            border-right-color: rgba(0, 0, 0, 0.12) !important;
-            min-width: clamp(240px, 22vw, 320px) !important;
-            width: clamp(240px, 22vw, 320px) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stSidebar"],
-        :root[data-theme="dark"] [data-testid="stSidebar"] {
-            background: #000000 !important;
-            border-right-color: rgba(255, 255, 255, 0.12) !important;
-            min-width: clamp(240px, 22vw, 320px) !important;
-            width: clamp(240px, 22vw, 320px) !important;
-        }
-
-        [data-testid="stSidebarNav"] {
-            display: none !important;
-        }
-
-        [data-testid="stSidebar"] [data-baseweb="radio"] {
-            color: var(--ink-1) !important;
-        }
-
-        [data-testid="stSidebar"] [data-baseweb="radio"] span,
-        [data-testid="stSidebar"] [data-baseweb="radio"] label,
-        [data-testid="stSidebar"] [data-testid="stRadio"] {
-            color: var(--ink-1) !important;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
-        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] {
-            background: var(--surface) !important;
-            color: var(--ink-1) !important;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stFileUploader"] button,
-        [data-testid="stSidebar"] [data-testid="stFileUploader"] button span,
-        [data-testid="stSidebar"] [data-testid="stFileUploader"] button svg {
-            color: var(--ink-1) !important;
-            fill: var(--ink-1) !important;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stFileUploader"] button {
-            background: var(--surface) !important;
-            border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent) !important;
-        }
-
-        :root[data-user-theme="light"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
-        :root[data-theme="light"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
-        :root[data-user-theme="light"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"],
-        :root[data-theme="light"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] {
-            background: #ffffff !important;
-            color: #111111 !important;
-            border-color: rgba(0, 0, 0, 0.12) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
-        :root[data-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"],
-        :root[data-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] {
-            background: #000000 !important;
-            color: #ffffff !important;
-            border-color: rgba(255, 255, 255, 0.14) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *,
-        :root[data-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {
-            color: #f3f6fb !important;
-            fill: #f3f6fb !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploader"] button,
-        :root[data-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploader"] button {
-            background: rgba(45, 212, 191, 0.18) !important;
-            border-color: rgba(45, 212, 191, 0.48) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploader"] button span,
-        :root[data-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploader"] button span,
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploader"] button svg,
-        :root[data-theme="dark"] [data-testid="stSidebar"] [data-testid="stFileUploader"] button svg {
-            color: #f3f6fb !important;
-            fill: #f3f6fb !important;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
-            padding-top: 1rem;
-            gap: 0.44rem;
-        }
-
-        [data-testid="stSidebar"] h2,
-        [data-testid="stSidebar"] h3 {
-            font-family: "DM Serif Display", Georgia, serif;
-            color: var(--ink-1);
-            letter-spacing: 0.01em;
-            margin-bottom: 0.2rem;
-        }
-
-        [data-testid="stFileUploader"] {
-            background: var(--card);
-            border: 1px solid var(--card-border);
-            border-radius: 14px;
-            padding: 0.45rem;
-        }
-
-        :root[data-user-theme="light"] [data-testid="stFileUploader"],
-        :root[data-theme="light"] [data-testid="stFileUploader"] {
-            background: #ffffff !important;
-            border-color: rgba(0, 0, 0, 0.12) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stFileUploader"],
-        :root[data-theme="dark"] [data-testid="stFileUploader"] {
-            background: #000000 !important;
-            border-color: rgba(255, 255, 255, 0.14) !important;
-        }
-
-        [data-testid="stAlert"] {
-            border-radius: 12px;
-            border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
-        }
-
-        .stButton > button,
-        .stDownloadButton > button {
-            border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
-            border-radius: 999px;
-            background: linear-gradient(135deg, var(--accent), var(--accent-strong));
-            color: #ffffff;
-            font-weight: 600;
-            transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease;
-            box-shadow: 0 9px 22px color-mix(in srgb, var(--accent) 28%, transparent);
-            min-height: 2.45rem;
-            letter-spacing: 0.01em;
-        }
-
-        .stButton > button:hover,
-        .stDownloadButton > button:hover {
-            transform: translateY(-1px) scale(1.01);
-            box-shadow: 0 13px 28px color-mix(in srgb, var(--accent) 36%, transparent);
-            filter: saturate(1.08);
-        }
-
-        .stButton > button:focus,
-        .stDownloadButton > button:focus {
-            outline: 2px solid color-mix(in srgb, var(--accent-2) 60%, var(--accent));
-            outline-offset: 2px;
-        }
-
-        [data-testid="stChatMessage"] {
-            border-radius: 16px;
-            padding: 0.72rem 0.88rem;
-            margin-bottom: 0.54rem;
-            border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
-            background: var(--card);
-            box-shadow: 0 8px 18px color-mix(in srgb, #0f172a 12%, transparent);
-            animation: fadeUp 280ms ease;
-            align-items: flex-start;
-        }
-
-        [data-testid="stChatMessageContent"] p {
-            margin: 0.12rem 0;
-            color: var(--ink-1);
-        }
-
-        [data-testid="stChatMessageContent"],
-        [data-testid="stChatMessageContent"] * {
-            color: var(--ink-1) !important;
-        }
-
-        [data-testid="stChatMessageAvatarUser"] {
-            background: var(--accent-2) !important;
-            color: #fff !important;
-        }
-
-        [data-testid="stChatMessageAvatarAssistant"] {
-            background: var(--accent) !important;
-            color: #fff !important;
-        }
-
-        [data-testid="stChatInput"] {
-            border-top: 1px solid color-mix(in srgb, var(--ink-1) 18%, transparent);
-            background: var(--bg-1);
-            backdrop-filter: blur(6px);
-        }
-
-        [data-testid="stChatInput"],
-        [data-testid="stChatInput"] > div,
-        [data-testid="stChatInput"] > div > div,
-        [data-testid="stChatInput"] textarea {
-            background: var(--surface) !important;
-            color: var(--ink-1) !important;
-        }
-
-        :root[data-user-theme="light"] [data-testid="stChatInput"],
-        :root[data-theme="light"] [data-testid="stChatInput"],
-        :root[data-user-theme="light"] [data-testid="stChatInput"] > div,
-        :root[data-theme="light"] [data-testid="stChatInput"] > div,
-        :root[data-user-theme="light"] [data-testid="stChatInput"] > div > div,
-        :root[data-theme="light"] [data-testid="stChatInput"] > div > div,
-        :root[data-user-theme="light"] [data-testid="stChatInput"] textarea,
-        :root[data-theme="light"] [data-testid="stChatInput"] textarea {
-            background: #ffffff !important;
-            color: #111111 !important;
-            border-color: rgba(0, 0, 0, 0.14) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stChatInput"],
-        :root[data-theme="dark"] [data-testid="stChatInput"],
-        :root[data-user-theme="dark"] [data-testid="stChatInput"] > div,
-        :root[data-theme="dark"] [data-testid="stChatInput"] > div,
-        :root[data-user-theme="dark"] [data-testid="stChatInput"] > div > div,
-        :root[data-theme="dark"] [data-testid="stChatInput"] > div > div,
-        :root[data-user-theme="dark"] [data-testid="stChatInput"] textarea,
-        :root[data-theme="dark"] [data-testid="stChatInput"] textarea {
-            background: #000000 !important;
-            color: #ffffff !important;
-            border-color: rgba(255, 255, 255, 0.14) !important;
-        }
-
-        [data-testid="stChatInput"] textarea,
-        [data-testid="stTextInput"] input {
-            color: var(--ink-1) !important;
-        }
-
-        [data-testid="stChatInput"] textarea::placeholder,
-        [data-testid="stTextInput"] input::placeholder {
-            color: var(--ink-soft) !important;
-            opacity: 1;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stAlert"],
-        :root[data-user-theme="dark"] [data-testid="stFileUploader"],
-        :root[data-user-theme="dark"] [data-testid="stChatMessage"],
-        :root[data-theme="dark"] [data-testid="stAlert"],
-        :root[data-theme="dark"] [data-testid="stFileUploader"],
-        :root[data-theme="dark"] [data-testid="stChatMessage"] {
-            border-color: rgba(148, 163, 184, 0.35) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] h2,
-        :root[data-user-theme="dark"] [data-testid="stSidebar"] h3,
-        :root[data-user-theme="dark"] .hero-title,
-        :root[data-user-theme="dark"] .hero-subtitle,
-        :root[data-user-theme="dark"] .metric-label,
-        :root[data-user-theme="dark"] .metric-value,
-        :root[data-theme="dark"] [data-testid="stSidebar"] h2,
-        :root[data-theme="dark"] [data-testid="stSidebar"] h3,
-        :root[data-theme="dark"] .hero-title,
-        :root[data-theme="dark"] .hero-subtitle,
-        :root[data-theme="dark"] .metric-label,
-        :root[data-theme="dark"] .metric-value {
-            color: var(--ink-1) !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stToolbar"] button,
-        :root[data-theme="dark"] [data-testid="stToolbar"] button {
-            background: rgba(15, 23, 42, 0.72) !important;
-            border: 1px solid rgba(148, 163, 184, 0.45) !important;
-            color: #f3f6fb !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stToolbar"] button svg,
-        :root[data-theme="dark"] [data-testid="stToolbar"] button svg,
-        :root[data-user-theme="dark"] [data-testid="stToolbar"] *,
-        :root[data-theme="dark"] [data-testid="stToolbar"] * {
-            color: #f3f6fb !important;
-            fill: #f3f6fb !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stChatInput"] > div,
-        :root[data-theme="dark"] [data-testid="stChatInput"] > div {
-            background: rgba(15, 23, 42, 0.92) !important;
-            border: 1px solid rgba(148, 163, 184, 0.45) !important;
-            border-radius: 14px !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stChatInput"] button,
-        :root[data-theme="dark"] [data-testid="stChatInput"] button {
-            background: rgba(45, 212, 191, 0.25) !important;
-            border: 1px solid rgba(45, 212, 191, 0.55) !important;
-            color: #f3f6fb !important;
-        }
-
-        :root[data-user-theme="dark"] [data-testid="stChatInput"] button svg,
-        :root[data-theme="dark"] [data-testid="stChatInput"] button svg {
-            fill: #f3f6fb !important;
-            color: #f3f6fb !important;
-        }
-
-        @keyframes fadeUp {
-            from { opacity: 0; transform: translateY(8px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        @media (max-width: 768px) {
-            .block-container {
-                padding-top: 1rem;
-                padding-left: 0.8rem;
-                padding-right: 0.8rem;
-            }
-
-            [data-testid="stSidebar"] {
-                min-width: auto !important;
-                width: auto !important;
-            }
-
-            .hero-card {
-                border-radius: 16px;
-                padding: 0.92rem;
-            }
-
-            .hero-title {
-                font-size: 1.8rem;
-            }
-
-            .hero-metrics {
-                gap: 0.45rem;
-            }
-
-            .metric-pill {
-                width: 100%;
-                justify-content: space-between;
-            }
-
-            .stButton > button,
-            .stDownloadButton > button {
-                width: 100%;
-            }
-        }
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@700;800;900&display=swap');
+        html, body, [class*="css"], .stApp {font-family: 'Manrope', sans-serif;}
+        h1 {font-size: 2rem !important; letter-spacing: -0.02em;}
+        .brand-title {font-family: 'Outfit', sans-serif; font-size: 3.05rem; line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 .25rem 0; font-weight: 900;}
+        .brand-full {background: linear-gradient(90deg, #14b8a6 0%, #0ea5e9 45%, #2563eb 100%); -webkit-background-clip: text; background-clip: text; color: transparent;}
+        h2 {font-size: 1.35rem !important;} h3 {font-size: 1.1rem !important;}
+        .stCaption, [data-testid="stMetricLabel"] {font-size: 0.92rem !important;}
+        [data-testid="stMetricValue"] {font-size: 1.4rem !important; font-weight: 700;}
+        .stButton>button, .stDownloadButton>button {font-size: 0.95rem; padding: 0.45rem 0.85rem; border-radius: 10px;}
+        .stChatInput input {font-size: 1rem !important;}
+        [data-testid="stChatMessageContent"] p, [data-testid="stChatMessageContent"] li {font-size: 1rem !important; line-height: 1.6;}
+        [data-testid="stSidebar"] * {font-size: 0.95rem;}
         </style>
         """,
         unsafe_allow_html=True,
     )
+    if "messages" not in st.session_state:
+        st.session_state.messages = load_history()
+    st.session_state.setdefault("indexed_files", set())
 
-    indexed_sources_preview = get_unique_sources(collection)
-    if not st.session_state.indexed_files:
-        st.session_state.indexed_files.update(indexed_sources_preview)
-    render_hero(indexed_file_count=len(indexed_sources_preview), chunk_count=collection.count())
+    backend = get_llm_backend()
+    collection = get_collection()
+    ensure_files_dir()
+    data = collection.get(include=["metadatas"])
+    st.session_state.indexed_files.update(sorted({m.get("source", "Unknown") for m in data.get("metadatas", []) if m}))
+    st.session_state.indexed_files.update(list_stored_files())
+
+    st.markdown(
+        '<h1 class="brand-title"><span class="brand-full">SmartFile-AI</span></h1>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Ask from uploaded docs with sources, or ask anything generally.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Indexed Files", len(st.session_state.indexed_files))
+    c2.metric("Stored Chunks", collection.count())
+    c3.metric("Mode", "Doc + General")
 
     with st.sidebar:
-        st.divider()
         st.header("Documents")
-        uploaded_files = st.file_uploader(
-            "Upload PDF, DOC, DOCX, or TXT files.",
-            type=["pdf", "doc", "docx", "txt"],
-            accept_multiple_files=True,
-        )
-        if uploaded_files and len(uploaded_files) > MAX_UPLOADS:
-            st.error(f"Please upload at most {MAX_UPLOADS} files at a time.")
-            uploaded_files = uploaded_files[:MAX_UPLOADS]
+        files = st.file_uploader("Upload PDF, DOC, DOCX, or TXT", type=["pdf", "doc", "docx", "txt"], accept_multiple_files=True)
+        index_now = st.button("Store and Index uploaded files", use_container_width=True)
+        if files and len(files) > MAX_FILES:
+            st.error(f"Upload at most {MAX_FILES} files.")
+            files = files[:MAX_FILES]
 
         if st.button("New chat"):
-            clear_chat_history()
+            st.session_state.messages = []
+            save_history()
             st.rerun()
 
         if st.session_state.messages:
-            st.download_button(
-                "Download chat (JSON)",
-                data=chat_history_as_json(),
-                file_name="smart_file_chat_history.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-            st.download_button(
-                "Download chat (TXT)",
-                data=chat_history_as_text(),
-                file_name="smart_file_chat_history.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+            st.download_button("Download JSON", json.dumps(st.session_state.messages, indent=2, ensure_ascii=False), "chat_history.json", "application/json")
 
-        st.divider()
-        st.subheader("Index status")
+        st.subheader("Index Status")
         st.write(f"Stored chunks: {collection.count()}")
-        indexed_sources = sorted(st.session_state.indexed_files)
-        if indexed_sources:
-            st.write("Indexed files:")
-            for source in indexed_sources:
-                st.write(f"- {source}")
-        else:
-            st.info("No documents have been indexed yet.")
+        for s in sorted(st.session_state.indexed_files):
+            st.write(f"- {s}")
+
+        st.subheader("File Store (CRUD)")
+        stored_files = list_stored_files()
+        st.write(f"Stored file count: {len(stored_files)}")
+        selected_file = st.selectbox("Select stored file", [""] + stored_files)
+        c_upd, c_del = st.columns(2)
+        if c_upd.button("Update/Reindex", use_container_width=True):
+            if not selected_file:
+                st.warning("Select a file to reindex.")
+            else:
+                p = FILES_PATH / selected_file
+                try:
+                    n = index_file(backend, collection, p, selected_file)
+                    if n:
+                        st.session_state.indexed_files.add(selected_file)
+                    st.success(f"Reindexed {selected_file} with {n} chunks.")
+                except Exception as e:
+                    st.error(f"Update failed: {e}")
+        if c_del.button("Delete", use_container_width=True):
+            if not selected_file:
+                st.warning("Select a file to delete.")
+            else:
+                delete_stored_file(collection, selected_file)
+                st.session_state.indexed_files.discard(selected_file)
+                st.success(f"Deleted {selected_file} from storage and index.")
+        if st.button("Clear all stored files and index", use_container_width=True):
+            clear_all_stored_data(collection)
+            st.session_state.indexed_files = set()
+            st.success("Cleared all stored files and indexed chunks.")
 
         if not get_api_key():
-            st.warning("Set GOOGLE_API_KEY or GEMINI_API_KEY in your environment to enable Gemini.")
-        else:
-            st.success("Gemini API key detected.")
+            st.warning("Set GOOGLE_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY in .env")
+    if files and index_now:
+        total = 0
+        added = []
+        for f in files:
+            try:
+                p = save_uploaded_file(f)
+                with st.spinner(f"Indexing {f.name}..."):
+                    n = index_file(backend, collection, p, f.name)
+                    total += n
+                    if n:
+                        added.append(f.name)
+            except Exception as e:
+                st.error(f"{f.name}: {readable_error(e)}")
+        if total:
+            st.session_state.indexed_files.update(added)
+            st.success(f"Indexed {total} chunks from {len(added)} file(s).")
+            st.rerun()
+    for m in st.session_state.messages:
+        avatar = USER_AVATAR if m["role"] == "user" else ASSISTANT_AVATAR
+        with st.chat_message(m["role"], avatar=avatar):
+            st.markdown(m["content"])
 
-    if uploaded_files:
-        if client is None:
-            st.error("Gemini client is unavailable because no API key was found.")
-        else:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                indexed_count = 0
-                indexed_sources = []
-                for uploaded_file in uploaded_files:
-                    temp_path = Path(temp_dir) / uploaded_file.name
-                    temp_path.write_bytes(uploaded_file.getbuffer())
-                    try:
-                        with st.spinner(f"Indexing {uploaded_file.name}..."):
-                            chunk_count = ingest_uploaded_file(client, collection, temp_path, uploaded_file.name)
-                            indexed_count += chunk_count
-                            if chunk_count:
-                                indexed_sources.append(uploaded_file.name)
-                    except Exception as exc:
-                        st.error(f"{uploaded_file.name}: {exc}")
-                if indexed_count:
-                    st.session_state.indexed_files.update(indexed_sources)
-                    st.success(f"Indexed {indexed_count} chunks from {len(indexed_sources)} file(s).")
-
-    render_chat()
-
-    user_question = st.chat_input("Ask a question about your files or anything else")
-    if user_question:
-        append_message("user", user_question)
-        with st.chat_message("user"):
-            st.markdown(user_question)
-
-        if client is None:
-            assistant_answer = "Set GOOGLE_API_KEY or GEMINI_API_KEY to use Gemini."
+    q = st.chat_input("Ask your question")
+    if q:
+        add_message("user", q)
+        with st.chat_message("user", avatar=USER_AVATAR):
+            st.markdown(q)
+        if not backend or backend.get("provider") == "none":
+            a = "Set GOOGLE_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY to start chatting."
         else:
             with st.spinner("Thinking..."):
                 try:
-                    assistant_answer = route_question(client, collection, user_question, sorted(st.session_state.indexed_files))
-                except Exception as exc:
-                    assistant_answer = f"Unable to answer right now: {exc}"
-
-        append_message("assistant", assistant_answer)
-        with st.chat_message("assistant"):
-            st.markdown(assistant_answer)
-
-
+                    a = answer_question(backend, collection, q, sorted(st.session_state.indexed_files))
+                except Exception:
+                    if doc_question(q, sorted(st.session_state.indexed_files)):
+                        a = NOT_FOUND
+                    else:
+                        a = annotate_source(local_general_answer(q), "local fallback")
+        add_message("assistant", a)
+        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+            st.markdown(a)
 if __name__ == "__main__":
     main()

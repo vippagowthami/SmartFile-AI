@@ -1,3 +1,13 @@
-"""Optional static configuration for Streamlit deployment hooks."""
-STATIC_DIRECTORY = None
-STATIC_ROUTE = None
+APP_TITLE = "SmartFile-AI"
+APP_SUBTITLE = "Ask questions from your files, or ask anything."
+CHROMA_PATH = "chroma_db"
+CHAT_HISTORY_PATH = "chat_history.json"
+COLLECTION_NAME = "smart_file_documents"
+CHAT_MODEL = "gemini-2.5-flash"
+EMBED_MODEL = "gemini-embedding-001"
+MAX_UPLOAD_FILES = 5
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+EMBED_BATCH_SIZE = 16
+SIMILARITY_THRESHOLD = 0.55
+RETRY_ATTEMPTS = 3
